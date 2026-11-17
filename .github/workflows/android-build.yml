@@ -1,0 +1,323 @@
+
+name: Hades Web2APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: Application name
+        required: true
+        type: string
+      web_url:
+        description: Website URL
+        required: true
+        type: string
+      job_id:
+        description: Build ID
+        required: true
+        type: string
+      source_path:
+        description: Original ZIP path
+        required: true
+        type: string
+      icon_path:
+        description: Icon image path
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Validate source
+        env:
+          SOURCE_PATH: ${{ inputs.source_path }}
+          WEB_URL: ${{ inputs.web_url }}
+        run: |
+          python3 - <<'PY'
+          import os, zipfile
+          from urllib.parse import urlparse
+
+          url = urlparse(os.environ["WEB_URL"])
+          assert url.scheme in ("http", "https") and url.netloc
+
+          source = os.environ["SOURCE_PATH"]
+          assert os.path.isfile(source), "Original ZIP missing"
+
+          with zipfile.ZipFile(source) as z:
+              assert z.namelist(), "ZIP is empty"
+
+          print("Original ZIP validated.")
+          PY
+
+      - name: Install icon processor
+        run: pip install pillow
+
+      - name: Create Android project
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          WEB_URL: ${{ inputs.web_url }}
+          ICON_PATH: ${{ inputs.icon_path }}
+        run: |
+          mkdir -p app/src/main/java/com/hades/web2apk
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "HadesWeb2APK"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.hades.web2apk'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.hades.web2apk'
+                  minSdk 23
+                  targetSdk 28
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildFeatures {
+                  buildConfig true
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+          }
+
+          android.defaultConfig.buildConfigField(
+              'String',
+              'WEB_URL',
+              '"' + (System.getenv('WEB_URL') ?: 'https://example.com').replace('"', '') + '"'
+          )
+          EOF
+
+          python3 - <<'PY'
+          import os
+          import xml.sax.saxutils as xml
+
+          name = xml.escape(os.environ["APP_NAME"])
+          os.makedirs("app/src/main/res/values", exist_ok=True)
+
+          with open("app/src/main/res/values/strings.xml", "w") as f:
+              f.write(
+                  '<resources><string name="app_name">'
+                  + name +
+                  '</string></resources>'
+              )
+          PY
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/hades/web2apk/MainActivity.java <<'EOF'
+          package com.hades.web2apk;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Color;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebResourceRequest;
+
+          public class MainActivity extends Activity {
+
+              private WebView web;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  getWindow().setStatusBarColor(Color.rgb(12, 14, 22));
+                  getWindow().setNavigationBarColor(Color.rgb(12, 14, 22));
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(Color.rgb(12, 14, 22));
+
+                  WebSettings settings = web.getSettings();
+
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setLoadsImagesAutomatically(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setMixedContentMode(
+                      WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                  );
+
+                  web.setWebViewClient(new WebViewClient());
+                  web.setWebChromeClient(new WebChromeClient());
+
+                  setContentView(web);
+
+                  web.loadUrl(BuildConfig.WEB_URL);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web != null && web.canGoBack()) {
+                      web.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Generate application icon
+        env:
+          ICON_PATH: ${{ inputs.icon_path }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from PIL import Image, ImageDraw
+
+          icon = os.environ.get("ICON_PATH", "")
+
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192
+          }
+
+          for folder, size in sizes.items():
+              path = "app/src/main/res/" + folder
+              os.makedirs(path, exist_ok=True)
+
+              if icon and os.path.isfile(icon):
+                  image = Image.open(icon).convert("RGBA")
+                  side = min(image.size)
+                  x = (image.width - side) // 2
+                  y = (image.height - side) // 2
+                  image = image.crop(
+                      (x, y, x + side, y + side)
+                  )
+                  image = image.resize(
+                      (size, size),
+                      Image.Resampling.LANCZOS
+                  )
+              else:
+                  image = Image.new(
+                      "RGBA",
+                      (size, size),
+                      (30, 95, 210, 255)
+                  )
+                  draw = ImageDraw.Draw(image)
+                  draw.rounded_rectangle(
+                      (size * .1, size * .1, size * .9, size * .9),
+                      radius=size * .2,
+                      fill=(245, 248, 255, 255)
+                  )
+                  draw.text(
+                      (size * .34, size * .28),
+                      "H",
+                      fill=(30, 95, 210, 255)
+                  )
+
+              image.save(path + "/ic_launcher.png")
+          PY
+
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Prepare APK
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          mkdir -p output
+
+          NAME=$(echo "$APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_.-')
+
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "output/${NAME}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hades-PlayOs-APK
+          path: output/*.apk
+          retention-days: 14
